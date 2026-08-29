@@ -143,7 +143,25 @@ DUMMY_ASTEROIDS = pd.DataFrame({
     'eccentricity': [0.19, 0.19, 0.20, 0.19, 0.38],
     'inclination': [3.3, 3.3, 6.0, 5.9, 3.4]
 })
-
+# Historical Impact Events for Model Validation
+# Sources: peer-reviewed literature (see 'source' column)
+HISTORICAL_IMPACTS = pd.DataFrame({
+    'name': ['Chelyabinsk (2013)', 'Tunguska (1908)', 'Barringer Crater (~50,000 ya)', 'Chicxulub (~66 Mya)'],
+    'year': [2013, 1908, -50000, -66000000],
+    'diameter_m': [20, 60, 50, 12000],
+    'velocity_km_s': [19.16, 15.0, 12.8, 20.0],
+    'density_kg_m3': [3300, 3000, 7800, 3000],
+    'angle_deg': [18, 45, 45, 60],
+    'actual_energy_mt': [0.5, 12, 10, 1.0e8],
+    'actual_crater_km': [None, None, 1.186, 150],
+    'impact_type': ['Airburst', 'Airburst', 'Crater', 'Crater'],
+    'source': [
+        'Popova et al. 2013, Science',
+        'Chyba et al. 1993, Nature',
+        'Kring 2007, LPI Barringer Studies',
+        'Collins et al. 2020, Chicxulub Studies'
+    ]
+})
 # API Functions
 @st.cache_data(ttl=3600)
 def fetch_neo_feed(start_date, end_date, api_key=NASA_API_KEY):
@@ -262,6 +280,70 @@ def calculate_torino_scale(energy_megatons, probability):
         return 8 if probability > 0.01 else (5 if probability > 0.001 else 2)
     else:
         return 10 if probability > 0.01 else (7 if probability > 0.001 else 3)
+
+def calculate_model_accuracy():
+    """
+    Validate impact model formulas against documented historical events.
+    Passes known diameter/velocity/density through the SAME functions
+    used in the live simulator, then compares to published values.
+    """
+    results = []
+    
+    for _, event in HISTORICAL_IMPACTS.iterrows():
+        predicted_energy = calculate_impact_energy(
+            float(event['diameter_m']),
+            float(event['velocity_km_s']),
+            float(event['density_kg_m3'])
+        )
+        
+        energy_error_pct = abs(predicted_energy - event['actual_energy_mt']) / event['actual_energy_mt'] * 100
+        
+        predicted_crater = None
+        crater_error_pct = None
+        if event['impact_type'] == 'Crater' and event['actual_crater_km'] is not None:
+            predicted_crater = calculate_crater_diameter(predicted_energy, float(event['angle_deg']))
+            crater_error_pct = abs(predicted_crater - event['actual_crater_km']) / event['actual_crater_km'] * 100
+        
+        results.append({
+            'Event': event['name'],
+            'Actual Energy (MT)': event['actual_energy_mt'],
+            'Predicted Energy (MT)': round(predicted_energy, 3),
+            'Energy Error (%)': round(energy_error_pct, 1),
+            'Actual Crater (km)': event['actual_crater_km'],
+            'Predicted Crater (km)': round(predicted_crater, 3) if predicted_crater else None,
+            'Crater Error (%)': round(crater_error_pct, 1) if crater_error_pct is not None else None,
+            'Type': event['impact_type'],
+            'Source': event['source']
+        })
+    
+    return pd.DataFrame(results)
+
+
+def summarize_model_accuracy(validation_df):
+    """Compute overall accuracy summary statistics (MAPE, accuracy %, R²)"""
+    energy_errors = validation_df['Energy Error (%)'].dropna()
+    crater_errors = validation_df['Crater Error (%)'].dropna()
+    
+    energy_mape = energy_errors.mean()
+    energy_accuracy = max(0, 100 - energy_mape)
+    
+    crater_mape = crater_errors.mean() if len(crater_errors) > 0 else None
+    crater_accuracy = max(0, 100 - crater_mape) if crater_mape is not None else None
+    
+    # R² on log-scale (energies span orders of magnitude, so compare in log space)
+    log_actual = np.log10(validation_df['Actual Energy (MT)'].astype(float))
+    log_predicted = np.log10(validation_df['Predicted Energy (MT)'].astype(float))
+    r_value = np.corrcoef(log_actual, log_predicted)[0, 1]
+    
+    return {
+        'energy_mape': energy_mape,
+        'energy_accuracy': energy_accuracy,
+        'crater_mape': crater_mape,
+        'crater_accuracy': crater_accuracy,
+        'r_squared': r_value ** 2,
+        'n_events': len(validation_df),
+        'n_crater_events': len(crater_errors)
+    }
 
 def calculate_orbital_trajectory(semi_major_axis, eccentricity, inclination, time_steps=100):
     """Calculate orbital path using Keplerian elements"""
@@ -584,6 +666,9 @@ def create_impact_map(lat, lon, damage_zones, earthquake_data=None, show_crater=
 # Initialize session state
 if 'neo_data' not in st.session_state:
     st.session_state.neo_data = None
+if 'validation_df' not in st.session_state:
+    st.session_state.validation_df = calculate_model_accuracy()
+    st.session_state.model_accuracy_summary = summarize_model_accuracy(st.session_state.validation_df)
 if 'earthquake_data' not in st.session_state:
     st.session_state.earthquake_data = None
 if 'selected_lat' not in st.session_state:
@@ -686,8 +771,9 @@ with st.sidebar:
     """)
 
 # Main Tabs
-tab1, tab2, tab3 = st.tabs(["Impact Simulator", "3D Orbit Visualization", "NEO Database"])
-
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Impact Simulator", "3D Orbit Visualization", "NEO Database", "Model Validation"
+])
 with tab1:
     st.markdown('<div class="section-header"> Impact Simulation Parameters</div>', unsafe_allow_html=True)
     
@@ -803,6 +889,16 @@ with tab1:
         <div class="{alert_class}">
             <h3 style="margin:0;">{risk_level}</h3>
             <p style="margin:0.5rem 0 0 0;">Torino Scale: {torino_scale}/10 | Probability: {prob_pct:.4f}% | Elevation: {elev_val:.0f}m</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        acc = st.session_state.model_accuracy_summary
+        st.markdown(f"""
+        <div class="info-box">
+        <b>📊 Model Confidence:</b> This calculation engine has been validated against 
+        {acc['n_events']} historical impact events (Chelyabinsk, Tunguska, Barringer, Chicxulub) 
+        with <b>{acc['energy_accuracy']:.1f}% average accuracy</b> (MAPE: {acc['energy_mape']:.1f}%, 
+        log-scale R²: {acc['r_squared']:.3f}). See the "✅ Model Validation" tab for full details.
         </div>
         """, unsafe_allow_html=True)
         
@@ -1230,6 +1326,83 @@ with tab3:
     
     else:
         st.info("No NEO data loaded. Please fetch data from the sidebar.")
+
+with tab4:
+    st.markdown('<div class="section-header">✅ Model Validation Against Historical Events</div>', unsafe_allow_html=True)
+    
+    st.info("""
+    ImpactViz's physics formulas are validated by passing documented diameter, velocity, and 
+    density values from real historical impact events through the same calculation functions 
+    used in the live simulator, then comparing outputs to published values from peer-reviewed literature.
+    """)
+    
+    validation_df = st.session_state.validation_df
+    acc = st.session_state.model_accuracy_summary
+    
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Events Tested", acc['n_events'])
+    v2.metric("Energy Model Accuracy", f"{acc['energy_accuracy']:.1f}%")
+    v3.metric("Energy MAPE", f"{acc['energy_mape']:.1f}%")
+    v4.metric("Log-scale R²", f"{acc['r_squared']:.3f}")
+    
+    st.markdown("#### Predicted vs Actual Comparison")
+    st.dataframe(validation_df, use_container_width=True, hide_index=True)
+    
+    st.markdown("#### Energy Estimation Accuracy")
+    fig_val = go.Figure()
+    fig_val.add_trace(go.Bar(
+        x=validation_df['Event'], y=validation_df['Actual Energy (MT)'],
+        name='Actual (Documented)', marker_color='#28a745'
+    ))
+    fig_val.add_trace(go.Bar(
+        x=validation_df['Event'], y=validation_df['Predicted Energy (MT)'],
+        name='Predicted (Model)', marker_color='#0066a1'
+    ))
+    fig_val.update_layout(
+        barmode='group', yaxis_type='log',
+        yaxis_title='Energy (Megatons TNT, log scale)',
+        height=450, legend=dict(x=0.02, y=0.98)
+    )
+    st.plotly_chart(fig_val, use_container_width=True)
+    
+    crater_events = validation_df.dropna(subset=['Actual Crater (km)'])
+    if len(crater_events) > 0:
+        st.markdown("#### Crater Diameter Accuracy")
+        fig_crater = go.Figure()
+        fig_crater.add_trace(go.Bar(
+            x=crater_events['Event'], y=crater_events['Actual Crater (km)'],
+            name='Actual Crater', marker_color='#28a745'
+        ))
+        fig_crater.add_trace(go.Bar(
+            x=crater_events['Event'], y=crater_events['Predicted Crater (km)'],
+            name='Predicted Crater', marker_color='#dc3545'
+        ))
+        fig_crater.update_layout(barmode='group', yaxis_title='Crater Diameter (km)', height=400)
+        st.plotly_chart(fig_crater, use_container_width=True)
+    
+    with st.expander("📖 Methodology & Limitations", expanded=False):
+        st.markdown(f"""
+        **Validation Method:** MAPE (Mean Absolute Percentage Error) = mean(|predicted − actual| / actual × 100)
+        
+        **R² (log-scale):** {acc['r_squared']:.3f} — correlation between predicted and actual energy 
+        across orders of magnitude (Chelyabinsk ≈ 0.5 MT to Chicxulub ≈ 10⁸ MT)
+        
+        **Known Limitations:**
+        - Airburst events (Chelyabinsk, Tunguska) form no crater, so crater accuracy is tested only 
+          against ground-impact events (Barringer, Chicxulub)
+        - Published parameters for historical events carry their own scientific uncertainty ranges; 
+          this validation uses commonly-cited midpoint estimates
+        - Crater scaling assumes uniform target material and does not differentiate rock/sediment/ocean
+        - Chicxulub is an extreme extrapolation included to test model behavior at scale, well beyond 
+          typical NEO impact energies
+        """)
+    
+    st.download_button(
+        "📥 Download Validation Data (CSV)",
+        validation_df.to_csv(index=False),
+        f"model_validation_{datetime.now().strftime('%Y%m%d')}.csv",
+        use_container_width=True
+    )
 
 # Footer
 st.markdown("---")
